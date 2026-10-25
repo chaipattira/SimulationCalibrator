@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# MP-Gadget source (cloned separately, commit pinned in research-state.yaml) and its run outputs
+sims/
+**/output/
+
+# Large simulation outputs / checkpoints — keep out of git, store on HPC/data storage instead
+*.hdf5
+*.h5
+data/checkpoints/
+*.snapshot
+
+# OS / editor
+.DS_Store
+docs/superpowers

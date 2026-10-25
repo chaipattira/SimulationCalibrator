@@ -1,0 +1,53 @@
+"""BoxConfig for the high-resolution stage: L=100 Mpc/h, N=128, hydro physics (same
+switches as examples/star-small), final snapshot z=0.
+
+N scales with L to hold the particle spacing -- and therefore k_max_h_per_mpc, the
+particle Nyquist -- fixed: a lower k_max hides the baryonic feedback signal entirely
+(trials can then "converge" by tuning Sigma8 or WindSigma0 alone while every other
+parameter is badly off), so growing L at fixed N must be avoided.
+
+The partition is `cpu-interactive`, whose 1-hour wall-clock cap the CPU-hour estimate
+fits but does not guarantee. If a real run exceeds the cap, Slurm kills it with no
+partial credit (chi2 extraction reads only the final snapshot, so a killed run needs a
+full resubmit, not a resume); switch to a partition with a longer cap rather than
+trying to sneak past it.
+
+To use a different box, edit the HR_BOX fields below (and the matching Ngrid/BoxSize
+lines in templates/paramfile.genic, which write_paramfiles() does NOT sync
+automatically -- see the ic_ngrid note below) and re-derive k_max_h_per_mpc (particle
+Nyquist = pi*ic_ngrid/box_size_mpc_h) and k_min_h_per_mpc (fundamental mode =
+2*pi/box_size_mpc_h). judge/generate_target.py's run doubles as the timing pilot for
+whatever you change.
+"""
+import math
+import sys
+from pathlib import Path
+
+# This file is a .tmpl: it is copied into each experiment instance, which may live on
+# a separate filesystem tree with no real ancestry back to the repo, so the repo root
+# can't be found by walking up. new_experiment.py bakes in the __REPO_ROOT__
+# substitution at scaffold time (and strips the .tmpl suffix on copy).
+sys.path.insert(0, "__REPO_ROOT__/src")
+import calibration_env as env  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+
+# NOTE: ic_ngrid is bookkeeping only (feeds the Nyquist numbers above) -- the actual
+# particle grid size lives in templates/paramfile.genic's own Ngrid line and must be
+# kept in sync by hand; write_paramfiles() never threads ic_ngrid into the paramfile.
+HR_BOX = env.BoxConfig(
+    name="hr-L100N128",
+    template_dir=HERE / "templates",
+    box_size_mpc_h=100.0,
+    ic_ngrid=128,
+    final_scalefactor="1.0000",
+    min_modes=20,
+    k_max_h_per_mpc=4.02,  # particle Nyquist, pi*ic_ngrid/box_size_mpc_h
+    k_min_h_per_mpc=2 * math.pi / 100.0,  # ~0.0628 h/Mpc, fundamental mode 2*pi/box_size_mpc_h
+    partition="cpu-interactive",
+    ntasks=64,
+    cpus_per_task=2,
+    mem="240G",
+    job_time="01:00:00",
+    stall_timeout_s=15 * 60,
+)

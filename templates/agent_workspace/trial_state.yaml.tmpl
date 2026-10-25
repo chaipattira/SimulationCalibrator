@@ -1,0 +1,86 @@
+# Structured, machine-checkable state for the driver loop.
+# The agent APPENDS to trials and may set converged: true, but the driver enforces
+# budget_cpu_hours_cap independently -- don't rely solely on the agent noticing.
+#
+# __EXPERIMENT_NAME__, llm-agent condition: free CAMB proxy access (not counted here
+# -- see lab_notebook.md's "CAMB queries log") plus real HR trials, scored with the
+# unpaired-seed chi2 (calibration_env.compute_chi2 sigma_mode="unpaired").
+
+condition: llm-agent
+converged: false
+budget_cpu_hours_cap: null  # set this after judge/generate_target.py's timing run -- see README.md step 4
+budget_cpu_hours_used: 0.0
+
+# The 12-parameter search space (physics-based bounds, independent of box resolution).
+param_bounds:
+  Omega0:
+  - 0.2
+  - 0.45
+  OmegaBaryon:
+  - 0.03
+  - 0.06
+  Sigma8:
+  - 0.6
+  - 1.0
+  PrimordialIndex:
+  - 0.9
+  - 1.05
+  HubbleParam:
+  - 0.6
+  - 0.8
+  WindSigma0:
+  - 200.0
+  - 500.0
+  WindSpeedFactor:
+  - 1.5
+  - 6.0
+  WindFreeTravelLength:
+  - 5.0
+  - 60.0
+  WindFreeTravelDensFac:
+  - 0.02
+  - 0.5
+  BlackHoleFeedbackFactor:
+  - 0.01
+  - 0.15
+  BlackHoleAccretionFactor:
+  - 20.0
+  - 300.0
+  SeedBlackHoleMass:
+  - 5.0e-06
+  - 0.0001
+
+# Public examples/star-small-derived defaults -- the agent starts from realistic
+# public defaults, not from the hidden ground truth. Only real HR trials count against
+# the budget; CAMB queries are free and not tracked here.
+starting_guess:
+  Omega0: 0.288
+  OmegaBaryon: 0.0472
+  Sigma8: 0.80
+  PrimordialIndex: 0.971
+  HubbleParam: 0.7
+  WindSigma0: 353.0
+  WindSpeedFactor: 3.7
+  WindFreeTravelLength: 20.0
+  WindFreeTravelDensFac: 0.1
+  BlackHoleFeedbackFactor: 0.05
+  BlackHoleAccretionFactor: 100.0
+  SeedBlackHoleMass: 2.0e-5
+
+trials: []
+# Example of one record's shape (for the agent to match) -- real HR trials only,
+# CAMB queries are not recorded here:
+# - trial_id: 1
+#   params: {Omega0: 0.288, OmegaBaryon: 0.0472, Sigma8: 0.80, PrimordialIndex: 0.971,
+#            HubbleParam: 0.7, WindSigma0: 353.0, WindSpeedFactor: 3.7,
+#            WindFreeTravelLength: 20.0, WindFreeTravelDensFac: 0.1,
+#            BlackHoleFeedbackFactor: 0.05, BlackHoleAccretionFactor: 100.0,
+#            SeedBlackHoleMass: 2.0e-5}
+#   status: success
+#   seed: 1315465281
+#   chi2: 336.06
+#   reduced_chi2: 4.10
+#   cpu_hours: 0.51
+#   wall_time_min: 7.84
+#   change_summary: "Baseline starting_guess, unmodified. CAMB pre-check suggested Sigma8 was reasonably close."
+#   timestamp: "YYYY-MM-DDTHH:MM:SS"

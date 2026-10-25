@@ -1,0 +1,132 @@
+#!/bin/bash
+# Driver loop: repeatedly invoke a FRESH headless Claude Code instance, one trial per
+# invocation, until trial_state.yaml says converged or the budget is exhausted. Meant
+# to run inside tmux (survives disconnects; run `tmux attach` to check on it).
+#
+# llm-agent condition: the free CAMB/halofit low-fidelity proxy alongside real HR
+# trials.
+#
+# Usage: ./driver_llm-agent.sh
+set -uo pipefail  # NOT -e: a failed/timed-out invocation should not kill the loop
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="${HERE}/../llm-agent/agent_workspace"
+JUDGE_DIR="${HERE}/../judge"
+TARGET_DIR="${HERE}/../target"
+BOX_CONFIG_DIR="${HERE}/../box_config"
+PROJECT_ROOT="__REPO_ROOT__"
+LOGDIR="${HERE}/../driver_logs/llm-agent"
+mkdir -p "${LOGDIR}"
+
+# .venv/bin first: bare `python3` otherwise resolves to a system Python without this
+# project's dependencies (numpy/scipy/classy/pyyaml/camb) installed.
+export PATH="${PROJECT_ROOT}/.venv/bin:$PATH"
+export MPGADGET_ROOT="${PROJECT_ROOT}/sims/MP-Gadget"
+
+CLAUDE_MODEL="sonnet"
+INVOCATION_TIMEOUT="40m"   # hang-protection one level up from calibration_env's own watchdog
+
+# Claude-Code env vars leak from this driver's own environment if it is ever run from
+# inside a Claude Code session, causing the child to attach as a nested session
+# instead of a fresh one. Always clear them.
+CLAUDE_ENV_VARS_TO_CLEAR=(CLAUDE_CODE_SESSION_ID CLAUDECODE CLAUDE_CODE_CHILD_SESSION
+    CLAUDE_PID CLAUDE_CODE_ENTRYPOINT AI_AGENT CLAUDE_EFFORT
+    CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING CLAUDE_CODE_ENABLE_TASKS
+    CLAUDE_AGENT_SDK_VERSION)
+
+JOB_NAME_PREFIX="calib-__JOB_PREFIX__-llm-"
+JOB_POLL_INTERVAL_S=60
+
+wait_for_jobs_clear() {
+    # Guard against spawning a fresh instance while a submission from a prior
+    # invocation is still in flight. Two things can be in flight: an actual Slurm job
+    # (checked via squeue), or src/run_trial_daemon.py still trying to get one into
+    # the queue (checked via trial.lock's PID) -- squeue is blind to the latter, since
+    # a submission can retry sbatch for a while before any job appears in the queue.
+    # The job-name prefix is unique to this run so the check never collides with other
+    # jobs.
+    while true; do
+        local running lock_pid lock_alive=0
+        running=$(squeue -u "$USER" -h -o "%j" 2>/dev/null | grep -c "^${JOB_NAME_PREFIX}")
+        if [ -f "$WORKSPACE/trial.lock" ]; then
+            lock_pid=$(cat "$WORKSPACE/trial.lock" 2>/dev/null)
+            if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+                lock_alive=1
+            fi
+        fi
+        if [ "$running" -eq 0 ] && [ "$lock_alive" -eq 0 ]; then
+            return
+        fi
+        local ts
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        echo "[$ts] driver: waiting (squeue: ${running} in-flight ${JOB_NAME_PREFIX}* job(s), daemon lock alive: ${lock_alive}) before spawning next Claude Code instance" | tee -a "${LOGDIR}/driver.log"
+        sleep "$JOB_POLL_INTERVAL_S"
+    done
+}
+
+get_state() {
+    # Prints "converged" / "over_budget" / "continue" using the venv's python+yaml
+    "${PROJECT_ROOT}/.venv/bin/python3" - "$WORKSPACE/trial_state.yaml" <<'PYEOF'
+import sys, yaml
+state = yaml.safe_load(open(sys.argv[1]))
+if state.get("converged"):
+    print("converged")
+else:
+    cap = state.get("budget_cpu_hours_cap")
+    used = state.get("budget_cpu_hours_used", 0)
+    costs = [t["cpu_hours"] for t in (state.get("trials") or [])
+             if t.get("status") == "success" and "cpu_hours" in t]
+    min_trial_cost = min(costs) if costs else 0
+    if cap is None:
+        print("continue")  # budget cap not set yet -- see protocol.md / README.md step 4
+    elif used >= cap or (cap - used) < min_trial_cost:
+        print("over_budget")
+    else:
+        print("continue")
+PYEOF
+}
+
+iteration=0
+while true; do
+    iteration=$((iteration + 1))
+    status=$(get_state)
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    if [ "$status" != "continue" ]; then
+        echo "[$ts] driver: stopping, trial_state.yaml reports '$status'" | tee -a "${LOGDIR}/driver.log"
+        break
+    fi
+
+    echo "[$ts] driver: iteration $iteration, invoking Claude Code (timeout ${INVOCATION_TIMEOUT})" | tee -a "${LOGDIR}/driver.log"
+
+    cd "$WORKSPACE"
+    # bwrap: share the whole host filesystem/network as-is (the agent needs sbatch,
+    # squeue, network for the API call, etc.) EXCEPT judge/ (the hidden ground truth)
+    # and this run's code/ (driver internals), each shadowed by an empty tmpfs so they
+    # are invisible to the invocation. --add-dir grants the directories the agent
+    # legitimately needs: target/, src/, box_config/ (hr_box_config.py + this box's
+    # paramfile templates), the MP-Gadget source, and the MP-Gadget docs.
+    timeout "$INVOCATION_TIMEOUT" env "${CLAUDE_ENV_VARS_TO_CLEAR[@]/#/-u}" \
+        bwrap --dev-bind / / --tmpfs "$JUDGE_DIR" --tmpfs "$HERE" -- \
+        "$CLAUDE_CODE_EXECPATH" -p "$(cat "$WORKSPACE/TASK.md")" \
+        --model "$CLAUDE_MODEL" \
+        --permission-mode bypassPermissions \
+        --output-format stream-json --include-partial-messages --verbose \
+        --add-dir "$TARGET_DIR" "${PROJECT_ROOT}/src" "$BOX_CONFIG_DIR" "${PROJECT_ROOT}/sims/MP-Gadget" "${PROJECT_ROOT}/docs/sim-guide" \
+        > "${LOGDIR}/invocation_${iteration}.json" 2>&1
+    exit_code=$?
+
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [ $exit_code -eq 124 ]; then
+        echo "[$ts] driver: iteration $iteration TIMED OUT after ${INVOCATION_TIMEOUT} -- agent invocation itself hung, not just a Slurm job. See invocation_${iteration}.json" | tee -a "${LOGDIR}/driver.log"
+    elif [ $exit_code -ne 0 ]; then
+        echo "[$ts] driver: iteration $iteration exited with code $exit_code -- see invocation_${iteration}.json" | tee -a "${LOGDIR}/driver.log"
+    else
+        echo "[$ts] driver: iteration $iteration finished normally" | tee -a "${LOGDIR}/driver.log"
+    fi
+
+    wait_for_jobs_clear
+done
+
+echo "Driver stopped after ${iteration} iterations. Final state:" | tee -a "${LOGDIR}/driver.log"
+cat "$WORKSPACE/trial_state.yaml" | tee -a "${LOGDIR}/driver.log"

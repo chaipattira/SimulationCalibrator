@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Judge: run the hidden ground-truth theta_fid once (HR box: see
+box_config/hr_box_config.py) and extract the target P(k) table.
+
+Writes ONLY k/P/N_modes to ../target/target_powerspectrum.csv -- never theta_fid.yaml
+or the raw simulation output -- since the agent workspace must not have access to the
+hidden ground truth.
+
+This run doubles as the timing pilot for the box: use its cpu_hours to set
+budget_cpu_hours_cap in the trial_state.yaml files before launching any driver.
+"""
+import csv
+import shutil
+import sys
+from pathlib import Path
+
+import yaml
+
+sys.path.insert(0, "__REPO_ROOT__/src")  # absolute: the instance may not sit at a fixed depth under the repo
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "box_config"))
+import calibration_env as env  # noqa: E402
+import hr_box_config as hb  # noqa: E402
+
+JUDGE_DIR = Path(__file__).resolve().parent
+TARGET_DIR = JUDGE_DIR.parent / "target"
+
+
+def main():
+    theta_fid = yaml.safe_load((JUDGE_DIR / "theta_fid.yaml").read_text())["theta_fid"]
+    print(f"Running judge trial with hidden theta_fid: {theta_fid}")
+
+    rundir = JUDGE_DIR / "run"
+    # rundir is reused across manual retries -- make_class_power() refuses to
+    # overwrite an existing class_pk.dat, which would otherwise error out an
+    # otherwise-fine retry. Always start from a clean directory.
+    if rundir.exists():
+        shutil.rmtree(rundir)
+    env.write_paramfiles(theta_fid, rundir, box_config=hb.HR_BOX)
+    job_id = env.submit_job(rundir, job_name="calib-__JOB_PREFIX__-judge", box_config=hb.HR_BOX)
+    print(f"Submitted job {job_id}, waiting...")
+    result = env.wait_for_job(job_id, rundir, stall_timeout_s=hb.HR_BOX.stall_timeout_s)
+    print(f"Job finished: {result}")
+
+    if result["state"] != "COMPLETED":
+        print(f"ERROR: judge job ended in state {result['state']}, not writing target")
+        sys.exit(1)
+
+    k, pk, nmodes = env.parse_powerspectrum(rundir, scalefactor=hb.HR_BOX.final_scalefactor)
+
+    TARGET_DIR.mkdir(exist_ok=True)
+    with open(TARGET_DIR / "target_powerspectrum.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["k_h_per_Mpc", "P_k", "N_modes"])
+        for row in zip(k, pk, nmodes):
+            w.writerow(row)
+
+    (TARGET_DIR / "README.md").write_text(
+        "# Calibration target\n\n"
+        "This is the matter power spectrum P(k) your simulation must reproduce, at "
+        "__EXPERIMENT_NAME__'s box final snapshot -- see box_config/hr_box_config.py "
+        "for the exact L/N/z. Columns: k [h/Mpc], P(k), N_modes (number of Fourier "
+        "modes averaged into that bin). See protocol.md for which k-range is "
+        "meaningful for this experiment's chi2.\n\n"
+        "The parameters that produced this target are NOT available to you -- your "
+        "job is to find them (or values close enough in P(k)-space) by reasoning and "
+        "iterative simulation, not by searching for them elsewhere in this "
+        "repository or filesystem.\n"
+    )
+    print(f"Wrote target to {TARGET_DIR / 'target_powerspectrum.csv'} ({len(k)} bins, {result['cpu_hours']:.3f} CPU-hours)")
+
+
+if __name__ == "__main__":
+    main()

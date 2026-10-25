@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Draw the hidden theta_fid for __EXPERIMENT_NAME__: uniform within the 12-parameter
+param_bounds box (physics-based bounds, independent of box resolution).
+
+To continue an existing shared-seed theta batch, set SEED to that stream's seed and
+SKIP to however many draws precede this one, so this reproduces the next theta in the
+sequence. Otherwise (the default -- a fresh, independent theta_fid) SKIP is 0 and SEED
+is whatever new_experiment.py generated or was passed via --seed. No simulation
+involved either way -- free, and always reproducible by re-running this script.
+"""
+import random
+from pathlib import Path
+
+import yaml
+
+JUDGE_DIR = Path(__file__).resolve().parent
+
+PARAM_BOUNDS = {
+    "Omega0": (0.2, 0.45),
+    "OmegaBaryon": (0.03, 0.06),
+    "Sigma8": (0.6, 1.0),
+    "PrimordialIndex": (0.9, 1.05),
+    "HubbleParam": (0.6, 0.8),
+    "WindSigma0": (200.0, 500.0),
+    "WindSpeedFactor": (1.5, 6.0),
+    "WindFreeTravelLength": (5.0, 60.0),
+    "WindFreeTravelDensFac": (0.02, 0.5),
+    "BlackHoleFeedbackFactor": (0.01, 0.15),
+    "BlackHoleAccretionFactor": (20.0, 300.0),
+    "SeedBlackHoleMass": (5e-06, 0.0001),
+}
+
+SEED = __SEED__
+SKIP = __SKIP__  # draws taken (and discarded here) from this stream before this one
+
+
+def main():
+    rng = random.Random(SEED)
+    for _ in range(SKIP):
+        {name: rng.uniform(lo, hi) for name, (lo, hi) in PARAM_BOUNDS.items()}
+    theta_fid = {name: rng.uniform(lo, hi) for name, (lo, hi) in PARAM_BOUNDS.items()}
+
+    header = (
+        "# HIDDEN ground truth. Do not copy, symlink, or expose this file (or this\n"
+        "# directory) into agent_workspace/ -- the agent must only ever see the\n"
+        "# resulting target P(k), not these values.\n"
+        "#\n"
+        f"# __EXPERIMENT_NAME__'s theta_fid. Drawn uniformly at random within\n"
+        f"# param_bounds (see agent_workspace/trial_state.yaml), random.Random(seed={SEED}),\n"
+        f"# skipping {SKIP} prior draws from that stream.\n"
+    )
+    body = yaml.dump({"theta_fid": theta_fid}, sort_keys=False, default_flow_style=False)
+    (JUDGE_DIR / "theta_fid.yaml").write_text(header + body)
+    print(f"Wrote {JUDGE_DIR / 'theta_fid.yaml'}")
+    print(yaml.dump({"theta_fid": theta_fid}, sort_keys=False))
+
+
+if __name__ == "__main__":
+    main()

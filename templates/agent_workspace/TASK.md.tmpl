@@ -1,0 +1,212 @@
+# Your task: calibrate MP-Gadget parameters against a target power spectrum
+
+You are one instance in a series -- fresh agent invoked each trial, no memory except what's
+written to disk. Read, in order, each session:
+
+1. `lab_notebook.md` -- past reasoning and what you've learned so far.
+2. `trial_state.yaml` -- structured record of every trial run so far (params,
+   chi2, cpu_hours), starting guess, CPU-hour budget.
+3. `../../target/target_powerspectrum.csv` -- power spectrum you're trying to
+   match, and `../../target/README.md` for column definitions. (Two levels up
+   from this workspace, alongside a `judge/` directory you should never
+   read -- see Boundaries below. In practice `judge/` won't exist from
+   where you're running: hidden from this session's filesystem view.)
+
+If `trial_state.yaml` has zero trials, starting guess is the `starting_guess`
+block already in that file -- run it first as trial 1 to establish baseline before
+changing anything.
+
+## The simulation box
+
+Target produced by a box with L=100 Mpc/h, N=128, final snapshot z=0.
+
+Every real MP-Gadget trial uses its own independent random seed (not shared
+with target's), so chi2 will be noisier trial to trial even at fixed
+parameters -- expected, not a bug. See `docs/sim-guide/mp-gadget.md`'s `Seed`
+entry for what this noise should look like.
+
+## Low-fidelity CAMB stage (free -- optional, use whenever useful)
+
+`src/camb_proxy.py`'s `nonlinear_matter_power()` computes CAMB's halofit nonlinear
+matter power spectrum for a given cosmology, in seconds, no Slurm job, no
+CPU-hour cost:
+
+```python
+import sys
+sys.path.insert(0, "__REPO_ROOT__/src")
+import camb_proxy
+
+pk = camb_proxy.nonlinear_matter_power(
+    k_h_per_mpc=target_k,          # evaluate at the same k-bins as the target
+    omega0=..., omega_baryon=..., sigma8=..., hubble_param=..., primordial_index=...,
+    z=0.0,
+)
+```
+
+**Only helps with the 5 cosmological parameters** (`Omega0`,
+`OmegaBaryon`, `Sigma8`, `PrimordialIndex`, `HubbleParam`). CAMB/halofit has no
+representation of AGN feedback or galactic winds -- dark-matter-only
+calculation. Won't respond to `WindSigma0`, `WindSpeedFactor`,
+`WindFreeTravelLength`, `WindFreeTravelDensFac`, `BlackHoleFeedbackFactor`,
+`BlackHoleAccretionFactor`, or `SeedBlackHoleMass` -- don't waste queries
+tuning those. Expect CAMB to track target at low-k end of this experiment's
+range (k close to box's fundamental mode, ~0.0628 h/Mpc), increasingly
+diverging toward k=4.02 h/Mpc (box's particle Nyquist, top of scored range),
+since true target includes baryonic suppression/feedback signatures CAMB
+can't capture -- divergence itself is informative (tells you something about
+the baryonic physics real trials must pin down), not a sign CAMB is broken.
+**Note**: `Sigma8` alone can fake much of that suppression by sitting below its
+true value across this k-range, so don't treat a CAMB-only match as confirmation
+the cosmology is exactly right -- only real HR trials (which include baryons) can
+confirm that.
+
+Sensible strategy: use CAMB queries (as many as wanted, free) to find a
+cosmology matching target well at low-to-mid k, before spending real HR
+trials. Then use real trials to refine that cosmology and fit the 7 baryonic
+parameters, which only a real simulation can constrain.
+
+## What you're tuning (in the real HR simulation)
+
+Twelve MP-Gadget parameters:
+- Cosmological: `Omega0`, `OmegaBaryon`, `Sigma8`, `PrimordialIndex`, `HubbleParam`.
+- Subgrid stellar/AGN feedback: `WindSigma0`, `WindSpeedFactor`,
+  `WindFreeTravelLength`, `WindFreeTravelDensFac`, `BlackHoleFeedbackFactor`,
+  `BlackHoleAccretionFactor`, `SeedBlackHoleMass`.
+
+See "Available documentation" below for `docs/sim-guide/mp-gadget.md` (read first for
+these mechanisms) and the MP-Gadget source fallback.
+
+**Important**: `run_trial()`'s `params` dict only accepts the twelve names above;
+anything else passed is silently ignored (never written to paramfiles).
+
+## How to run a real HR trial
+
+Trial submission-and-wait handled by shared script `src/run_trial_daemon.py`
+-- don't write your own `subprocess`/`nohup` submission code.
+
+**Step 1: check whether a trial is already in flight.** Before anything
+else, read `trial.status` in this workspace if it exists:
+
+```python
+import json
+from pathlib import Path
+status = json.loads(Path("trial.status").read_text()) if Path("trial.status").exists() else None
+```
+
+- Missing, or `state` is `"done"`/`"failed"` **and** `trial_id` already
+  recorded in `trial_state.yaml`'s `trials` list -- nothing in flight, nothing
+  pending. Go to Step 2 to plan and launch new trial (after any free tool
+  queries wanted first).
+- `state` is `"done"` or `"failed"` but `trial_id` NOT yet in
+  `trial_state.yaml` -- trial just finished, needs recording. Read
+  `trial.result.json` (chi2, reduced_chi2, per-bin `table`, cpu_hours,
+  wall_time_min) and follow "What to do with the result" below before considering
+  new trial.
+- `state` is `"writing_paramfiles"`, `"submitting"`, or `"running"` -- submission
+  genuinely in flight (may still be retrying `sbatch` under Slurm queue
+  contention -- expected, not a bug). **Don't launch
+  another.** Note this briefly in `lab_notebook.md` (optionally use any free
+  tools available while you wait), then exit -- driver won't spawn next
+  instance until this one's lock clears.
+
+**Step 2: launch a new trial.** Decide twelve parameters as before, write
+reasoning to `lab_notebook.md`'s "Next Planned Trial" section (see step 1 under
+"What to do with the result" below) BEFORE launching, then:
+
+```python
+import json
+from pathlib import Path
+next_trial = {
+    "trial_id": next_id,  # len(trial_state.yaml's trials) + 1
+    "params": {"Omega0": ..., "OmegaBaryon": ..., "Sigma8": ...,
+               "PrimordialIndex": ..., "HubbleParam": ...,
+               "WindSigma0": ..., "WindSpeedFactor": ...,
+               "WindFreeTravelLength": ..., "WindFreeTravelDensFac": ...,
+               "BlackHoleFeedbackFactor": ..., "BlackHoleAccretionFactor": ...,
+               "SeedBlackHoleMass": ...},
+    "seed": trial_seed,  # random.randint(1, 2**31 - 1) -- fresh every trial, never reused
+    "job_name": f"calib-__JOB_PREFIX__-llm-{next_id}",
+    "sigma_mode": "unpaired",
+}
+Path("next_trial.json").write_text(json.dumps(next_trial))
+```
+
+Then, from a Bash tool call:
+
+```bash
+nohup python3 __REPO_ROOT__/src/run_trial_daemon.py \
+    --request next_trial.json \
+    --target ../../target/target_powerspectrum.csv \
+    --box-config ../../box_config/hr_box_config.py:HR_BOX \
+    > trial_daemon.log 2>&1 &
+disown
+```
+
+Returns almost instantly -- daemon does the waiting, detached from your
+session. Don't bump your own tool timeout to cover full trial duration and
+wait on it inline; just confirm it launched (e.g. `trial.status` shows
+`"writing_paramfiles"` or `"submitting"` a moment later) and exit. It handles
+submission retries itself, writes `trial.lock` / `trial.status` /
+`trial.result.json` for the next instance to read.
+
+## What to do with the result
+
+1. **Before** writing `next_trial.json` and launching the daemon, write
+   reasoning for the parameters about to try into `lab_notebook.md` under
+   "Next Planned Trial"
+   before seeing the outcome. Hard project convention: never write
+   reasoning after seeing the result and call it a prediction. Free tool
+   queries (any available above) don't need this pre-registration
+   (free/reversible/no experimental integrity concern), but log what you
+   learned from them in `lab_notebook.md` too, so the next fresh instance can
+   pick up where you left off.
+2. **When you find** `trial.status` shows `"done"` or `"failed"` for a `trial_id`
+   not yet in `trial_state.yaml` (see Step 1 of "How to run a real HR trial" above),
+   append a dated entry to the "Trial-by-trial log" section of `lab_notebook.md`:
+   what you tried, why, what happened, what it tells you (failed/crashed
+   trial informative too -- note what parameter region to avoid and why, don't
+   just discard it). If a result looks like an outlier relative to recent
+   trend, consider whether trial-to-trial seed noise explains it before concluding
+   your parameters moved things the wrong direction.
+3. Append a structured record to `trial_state.yaml`'s `trials` list with the same
+   fields shown in its commented example -- including `seed` (read `params`/`seed`
+   back from `next_trial.json` or the record already written to `lab_notebook.md`,
+   and `chi2`/`reduced_chi2`/`cpu_hours`/`wall_time_min` from `trial.result.json`).
+   Free tool queries aren't real trials and don't get a `trial_state.yaml` entry or
+   budget charge -- just log them in the notebook.
+4. Update `lab_notebook.md`'s "Current Understanding" and "Lessons and Constraints"
+   sections if this trial (or a free tool query) changed your model of the parameter ->
+   P(k) mapping. Prune stale reasoning rather than letting this section grow forever.
+5. Decide: if reduced_chi2 (from a real HR trial) is below 1 within the k-range
+   [k_f~=0.0628, 4.02] h/Mpc, you've converged -- set `converged: true` in
+   `trial_state.yaml` and stop. If `budget_cpu_hours_used` is at or past
+   `budget_cpu_hours_cap`, also stop (note in the notebook that you ran out of
+   budget without converging -- a valid, informative outcome, not a failure
+   to hide).
+6. Otherwise, launch exactly one new real HR trial (free tool queries don't count
+   toward this limit -- use them as many times as useful), then exit. At most one
+   trial may ever be in flight at a time -- `run_trial_daemon.py` enforces this itself
+   (it refuses to start a second submission while `trial.lock` names a live process),
+   so don't try to work around it. This keeps each invocation short-lived and robust
+   to crashes/disconnects -- the point is never more than one trial in flight, not more
+   than one invocation per trial (a single trial's submission-and-wait may span
+   several fresh instances if retrying under QOS contention, which is fine).
+
+## Boundaries
+
+Stay within this workspace, the target/ directory two levels up, and the MP-Gadget
+source/docs. Don't look for the true parameter values elsewhere on the
+filesystem -- point of this experiment is whether you can find them through
+physical reasoning and iterative simulation, not by searching for the answer. In
+practice a `judge/` directory that would contain them is hidden from this session
+entirely, so searching for it is also wasted effort.
+
+## Available documentation
+
+Read `docs/sim-guide/mp-gadget.md` first -- single dense reference covering how each
+MP-Gadget parameter affects the matter power spectrum, plus a diagnostics guide
+mapping observed P(k) discrepancies back to which parameter(s) to try and in which
+direction. Fall back to the actual MP-Gadget source (path given by `MPGADGET_ROOT`,
+see `src/calibration_env.py`; inline docs in `gadget/params.c`/`genic/params.c`,
+`README.rst`) for anything not covered in enough depth, plus whatever you already
+know about cosmological simulations from training.
